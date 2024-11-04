@@ -1,0 +1,121 @@
+-- Разовая загрузка данных в витрину покупателей
+-- Ежедневное обновление бизнес полей самоката и СММ
+
+-- Какой ключ дистрибьюции? Джойн будет по бизнес полям. Какие ещё будут запросы?
+
+-- Цель - grp_ssa_prof.customer
+
+-- название ветки feature/DP-1474-customer
+
+-- set hash_key = 'e8c5bdda7cd6f4ed1d056114246e4c1c8ed0a10a80c6c37ca20bcc34e4f597b3'
+
+--===========================================--
+--== Иницивлизирующая загрузка ==--
+--===========================================--  
+ 
+/* 1. Отбор данных из СМКТ */
+with smkt_data_full as (
+select
+    user_id,
+    mobile,
+    row_number() over (partition by mobile order by updated desc) as rn
+from
+grp_ods_cuspr.samokat_user_profile_snp
+where length(mobile) <> 36
+    and user_id is not null
+)
+,
+smkt_data as (
+select *
+from smkt_data_full
+where rn = 1
+)
+,
+/* 2. Отбор данных из СММ */
+smm_data_full as (
+select
+    customer_code,
+    phone,
+-- в источнике нет данных о последнем обновлении информации о клиенте, данная логика это согласованный тех долг
+    row_number() over (partition by phone order by customer_code desc) as rn    
+from grp_ods_jds3_smm00.customer_profile_init_snp
+where customer_code not in (
+    select customer_code  from grp_ods_jds3_smm00.customer_profile_snp
+    )
+    and customer_code is not null
+)
+,
+smm_data as (
+select *
+from smm_data_full
+where rn = 1
+)
+/* 3. Объединение в Золотую Запись */
+select
+-- В MVP как унификатор можно использовать row_number так как не будет регламентной загрузки с добавлением новых клиентов
+    row_number() over (order by smkt_data.user_id, smm_data.customer_code) as customer_no,
+    smkt_data.user_id::int as smkt_customer_id,
+    smm_data.customer_code::text as smm_customer_id
+from
+smkt_data
+full join
+smm_data
+on smkt_data.mobile = smm_data.phone
+ 
+--===========================================--
+--== Регламентная загрузка ==--
+--===========================================--
+ 
+  -- В рамках MVP регламентной загрузки данных происходит только очистка информации о клиентах, которые отменили обработку ПД
+  -- В рамках MVP не производится дополнительная загрузка данных в таблицу из источников по клиентам
+  -- Загрузка идет методом update-insert
+ 
+select
+    customer_no,
+    case when cdc.user_id is not null then null else smkt_customer_id end as smkt_customer_id,
+    case when cps.customer_code is not null then null else smm_customer_id end as smm_customer_id  
+from grp_ssa_prof.customer cst
+left join grp_ods_cuspr.samokat_user_profile_cdc cdc
+    on smkt_customer_id = cdc.user_id
+    and cdc.dataflow_dttm >= $cut_param
+    and length(cdc.mobile) = 36
+left join grp_ods_jds3_smm00.customer_profile_snp cps
+    on smm_customer_id = cps.customer_code
+    and cps.dataflow_dttm >= $cut_param
+ 
+ 
+ 
+
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+--поток данных СМКТ
+with smkt_data as (
+	select cdc.user_id
+	from grp_ods_cuspr.samokat_user_profile_cdc cdc
+		and length(cdc.mobile) = 36 -- claim_id
+		and cdc.dataflow_dttm >= $cut_param   
+ )
+--поток данных СММ
+,
+smm_data as (
+	select phone
+	where cst.smm_customer_id  in (select customer_code from grp_ods_jds3_smm00.customer_profile_snp)
+)
+select
+	encode(hmac(coalesce(smkt_data.mobile, smm_data.phone),hash_key,'sha256'),'hex') as customer_no
+	,case when smkt_data.user_id is not null then null else 'оставить старое значение' end as smkt_customer_id,
+    ,case when smm_data.customer_code is not null then null else 'оставить старое значение' end as smm_customer_id 
+from
+	smkt_data
+	full join smm_data
+		on smkt_data.mobile = smm_data.phone

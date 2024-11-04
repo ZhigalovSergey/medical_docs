@@ -1,1 +1,0 @@
-dbt run --select models\ssa\grp_ssa_prof\customer.sql --profiles-dir C:\_WORK\SMKT
